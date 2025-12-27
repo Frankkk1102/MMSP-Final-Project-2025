@@ -95,7 +95,7 @@ static void bmp_write_24(const char *path, const ImageRGB *im){
     ih.biPlanes=1;
     ih.biBitCount=24;
     ih.biCompression=0;
-    ih.biSizeImage=datasz;
+    ih.biSizeImage=0;
 
     fwrite(&fh,sizeof(fh),1,fp);
     fwrite(&ih,sizeof(ih),1,fp);
