@@ -1,5 +1,5 @@
-// decoder.c — MMSP final JPEG pipeline (mode 0..3)
-// Build: gcc -O2 -std=c11 -lm -o decoder decoder.c
+// decoder.c (C11) — MMSP Final Project JPEG-like pipeline (Mode 0..3)
+// Build: gcc/clang -O2 -std=c11 -Wall -Wextra -pedantic -lm -o decoder decoder.c
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,19 +14,70 @@
 static void die(const char *msg){ fprintf(stderr,"Error: %s\n", msg); exit(1); }
 static int clampi(int v,int lo,int hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
 
-// ---------------- BMP (24-bit, uncompressed) ----------------
+// ---------- BMP 24-bit uncompressed ----------
 #pragma pack(push,1)
-typedef struct { uint16_t bfType; uint32_t bfSize; uint16_t r1,r2; uint32_t bfOffBits; } BFH;
 typedef struct {
-    uint32_t biSize; int32_t w,h; uint16_t planes,bpp; uint32_t comp; uint32_t imgsize;
-    int32_t xppm,yppm; uint32_t clrused,clrimpt;
+    uint16_t bfType;
+    uint32_t bfSize;
+    uint16_t bfReserved1;
+    uint16_t bfReserved2;
+    uint32_t bfOffBits;
+} BFH;
+
+typedef struct {
+    uint32_t biSize;
+    int32_t  biWidth;
+    int32_t  biHeight;
+    uint16_t biPlanes;
+    uint16_t biBitCount;
+    uint32_t biCompression;
+    uint32_t biSizeImage;
+    int32_t  biXPelsPerMeter;
+    int32_t  biYPelsPerMeter;
+    uint32_t biClrUsed;
+    uint32_t biClrImportant;
 } BIH;
 #pragma pack(pop)
 
 typedef struct { int w,h; uint8_t *rgb; } ImageRGB;
 
+static ImageRGB bmp_read_24(const char *path){
+    FILE *fp=fopen(path,"rb"); if(!fp) die("cannot open bmp");
+    BFH fh; BIH ih;
+    if(fread(&fh,sizeof(fh),1,fp)!=1) die("bmp file header");
+    if(fread(&ih,sizeof(ih),1,fp)!=1) die("bmp info header");
+    if(fh.bfType!=0x4D42) die("not BMP");
+    if(ih.biBitCount!=24 || ih.biCompression!=0) die("only 24-bit uncompressed BMP supported");
+
+    int w=ih.biWidth;
+    int h=(ih.biHeight>0)? ih.biHeight : -ih.biHeight;
+    int bottom_up=(ih.biHeight>0);
+
+    ImageRGB im; im.w=w; im.h=h;
+    im.rgb=(uint8_t*)malloc((size_t)w*h*3); if(!im.rgb) die("OOM");
+
+    int rowbytes=w*3;
+    int pad=(4-(rowbytes%4))%4;
+
+    fseek(fp, (long)fh.bfOffBits, SEEK_SET);
+    for(int y=0;y<h;y++){
+        int ry = bottom_up ? (h-1-y) : y;
+        uint8_t *row = im.rgb + (size_t)ry*w*3;
+        for(int x=0;x<w;x++){
+            uint8_t bgr[3];
+            if(fread(bgr,1,3,fp)!=3) die("bmp read pixel");
+            row[3*x+0]=bgr[2];
+            row[3*x+1]=bgr[1];
+            row[3*x+2]=bgr[0];
+        }
+        for(int p=0;p<pad;p++) (void)fgetc(fp);
+    }
+    fclose(fp);
+    return im;
+}
+
 static void bmp_write_24(const char *path, const ImageRGB *im){
-    FILE *fp=fopen(path,"wb"); if(!fp) die("open out bmp");
+    FILE *fp=fopen(path,"wb"); if(!fp) die("cannot write bmp");
 
     int rowbytes=im->w*3;
     int pad=(4-(rowbytes%4))%4;
@@ -35,16 +86,16 @@ static void bmp_write_24(const char *path, const ImageRGB *im){
     BFH fh={0};
     BIH ih={0};
     fh.bfType=0x4D42;
-    fh.bfOffBits=sizeof(BFH)+sizeof(BIH);
+    fh.bfOffBits=(uint32_t)(sizeof(BFH)+sizeof(BIH));
     fh.bfSize=fh.bfOffBits+datasz;
 
     ih.biSize=40;
-    ih.w=im->w;
-    ih.h=im->h; // bottom-up
-    ih.planes=1;
-    ih.bpp=24;
-    ih.comp=0;
-    ih.imgsize=datasz;
+    ih.biWidth=im->w;
+    ih.biHeight=im->h; // bottom-up
+    ih.biPlanes=1;
+    ih.biBitCount=24;
+    ih.biCompression=0;
+    ih.biSizeImage=datasz;
 
     fwrite(&fh,sizeof(fh),1,fp);
     fwrite(&ih,sizeof(ih),1,fp);
@@ -61,43 +112,9 @@ static void bmp_write_24(const char *path, const ImageRGB *im){
     fclose(fp);
 }
 
-static ImageRGB bmp_read_24(const char *path){
-    FILE *fp=fopen(path,"rb"); if(!fp) die("open bmp");
-    BFH fh; BIH ih;
-    if(fread(&fh,sizeof(fh),1,fp)!=1) die("hdr");
-    if(fread(&ih,sizeof(ih),1,fp)!=1) die("info");
-    if(fh.bfType!=0x4D42) die("not bmp");
-    if(ih.bpp!=24 || ih.comp!=0) die("only 24bpp uncompressed bmp");
-    int w=ih.w;
-    int h=(ih.h>0)?ih.h:-ih.h;
-    int bottom_up=(ih.h>0);
-
-    ImageRGB im; im.w=w; im.h=h;
-    im.rgb=(uint8_t*)malloc((size_t)w*h*3); if(!im.rgb) die("OOM");
-
-    int rowbytes=w*3;
-    int pad=(4-(rowbytes%4))%4;
-    fseek(fp, fh.bfOffBits, SEEK_SET);
-
-    for(int y=0;y<h;y++){
-        int ry = bottom_up ? (h-1-y) : y;
-        uint8_t *row = im.rgb + (size_t)ry*w*3;
-        for(int x=0;x<w;x++){
-            uint8_t bgr[3];
-            if(fread(bgr,1,3,fp)!=3) die("pix");
-            row[3*x+0]=bgr[2];
-            row[3*x+1]=bgr[1];
-            row[3*x+2]=bgr[0];
-        }
-        for(int p=0;p<pad;p++) fgetc(fp);
-    }
-    fclose(fp);
-    return im;
-}
-
 static void img_free(ImageRGB *im){ free(im->rgb); im->rgb=NULL; }
 
-// ---------------- RCT inverse (same as encoder) ----------------
+// ---------- Reversible Color Transform inverse ----------
 typedef struct { int w,h; int16_t *Y,*Cb,*Cr; } ImageYCCi;
 
 static ImageRGB ycc_to_rgb_rct(const ImageYCCi *ycc){
@@ -120,7 +137,7 @@ static ImageRGB ycc_to_rgb_rct(const ImageYCCi *ycc){
 
 static void ycc_free(ImageYCCi *im){ free(im->Y); free(im->Cb); free(im->Cr); im->Y=im->Cb=im->Cr=NULL; }
 
-// ---------------- DCT/IDCT ----------------
+// ---------- DCT/IDCT ----------
 static void idct8x8(const double in[8][8], double out[8][8]){
     for(int x=0;x<8;x++){
         for(int y=0;y<8;y++){
@@ -139,7 +156,7 @@ static void idct8x8(const double in[8][8], double out[8][8]){
     }
 }
 
-// ---------------- QT read ----------------
+// ---------- QT read ----------
 static void read_qt_txt(const char *path, int qt[8][8]){
     FILE *fp=fopen(path,"r"); if(!fp) die("open Qt txt");
     for(int i=0;i<8;i++){
@@ -150,7 +167,7 @@ static void read_qt_txt(const char *path, int qt[8][8]){
     fclose(fp);
 }
 
-// ---------------- ZigZag inverse ----------------
+// ---------- ZigZag inverse ----------
 static const uint8_t ZZ[64]={
  0,1,8,16,9,2,3,10,
  17,24,32,25,18,11,4,5,
@@ -167,6 +184,7 @@ static void zz_to_block(const int16_t in[64], int16_t b[8][8]){
     for(int i=0;i<8;i++) for(int j=0;j<8;j++) b[i][j]=tmp[i*8+j];
 }
 
+// ---------- Put block into plane ----------
 static void put_block_i16(int16_t *plane,int w,int h,int bx,int by,const double blk[8][8]){
     int x0=bx*8, y0=by*8;
     for(int i=0;i<8;i++){
@@ -179,7 +197,7 @@ static void put_block_i16(int16_t *plane,int w,int h,int bx,int by,const double 
     }
 }
 
-// ---------------- Mode 0 (decoder) ----------------
+// ---------- Mode 0 ----------
 static void mode0(const char *outbmp, const char *Rt, const char *Gt, const char *Bt, const char *dim){
     int W,H;
     FILE *fd=fopen(dim,"r"); if(!fd) die("dim.txt");
@@ -210,13 +228,13 @@ static void mode0(const char *outbmp, const char *Rt, const char *Gt, const char
     img_free(&im);
 }
 
-// ---------------- Pixel SQNR ----------------
+// ---------- Pixel SQNR (RGB) ----------
 static void print_pixel_sqnr_rgb(const ImageRGB *orig, const ImageRGB *rec){
     double sig[3]={0}, err[3]={0};
     size_t n=(size_t)orig->w*orig->h;
     for(size_t i=0;i<n;i++){
         for(int c=0;c<3;c++){
-            double s=orig->rgb[3*i+c];
+            double s=(double)orig->rgb[3*i+c];
             double d=(double)orig->rgb[3*i+c] - (double)rec->rgb[3*i+c];
             sig[c]+=s*s;
             err[c]+=d*d;
@@ -224,18 +242,18 @@ static void print_pixel_sqnr_rgb(const ImageRGB *orig, const ImageRGB *rec){
     }
     for(int c=0;c<3;c++){
         double sq = (err[c]<=0)?1e9:10.0*log10(sig[c]/err[c]);
-        const char *name = (c==0)?"R":(c==1)?"G":"B";
+        const char *name=(c==0)?"R":(c==1)?"G":"B";
         printf("Pixel SQNR %s: %.6f dB\n", name, sq);
     }
 }
 
-// ---------------- Mode 1a / 1b (decoder) ----------------
-static void decode_from_qf(const char *outbmp,
-                          int W,int H,
-                          const int qtY[8][8], const int qtC[8][8],
-                          FILE *fqY, FILE *fqCb, FILE *fqCr,
-                          FILE *feY, FILE *feCb, FILE *feCr,
-                          int use_error)
+// ---------- Mode 1 decode from qF (+ optional eF) ----------
+static void decode_mode1(const char *outbmp,
+                         int W,int H,
+                         const int qtY[8][8], const int qtC[8][8],
+                         FILE *fqY, FILE *fqCb, FILE *fqCr,
+                         FILE *feY, FILE *feCb, FILE *feCr,
+                         int use_error)
 {
     ImageYCCi ycc; ycc.w=W; ycc.h=H;
     size_t n=(size_t)W*H;
@@ -249,26 +267,22 @@ static void decode_from_qf(const char *outbmp,
     for(int by=0;by<nby;by++){
         for(int bx=0;bx<nbx;bx++){
             for(int comp=0;comp<3;comp++){
-                const int (*qt)[8] = (comp==0)?qtY:qtC;
+                const int (*qt)[8]=(comp==0)?qtY:qtC;
                 FILE *fq=(comp==0)?fqY:(comp==1)?fqCb:fqCr;
                 FILE *fe=(comp==0)?feY:(comp==1)?feCb:feCr;
+
                 int16_t q[8][8];
                 float   e[8][8];
 
-                for(int u=0;u<8;u++){
-                    for(int v=0;v<8;v++){
-                        if(fread(&q[u][v],sizeof(int16_t),1,fq)!=1) die("qF read");
-                    }
+                for(int u=0;u<8;u++) for(int v=0;v<8;v++){
+                    if(fread(&q[u][v],sizeof(int16_t),1,fq)!=1) die("qF read");
                 }
                 if(use_error){
-                    for(int u=0;u<8;u++){
-                        for(int v=0;v<8;v++){
-                            if(fread(&e[u][v],sizeof(float),1,fe)!=1) die("eF read");
-                        }
+                    for(int u=0;u<8;u++) for(int v=0;v<8;v++){
+                        if(fread(&e[u][v],sizeof(float),1,fe)!=1) die("eF read");
                     }
                 }
 
-                // recover F = q*Qt (+ error if provided)
                 double F[8][8];
                 for(int u=0;u<8;u++){
                     for(int v=0;v<8;v++){
@@ -277,87 +291,29 @@ static void decode_from_qf(const char *outbmp,
                     }
                 }
 
-                // IDCT -> spatial block
                 double blk[8][8];
-                idct8x8(F, blk);
+                idct8x8(F,blk);
 
-                int16_t *plane = (comp==0)?ycc.Y:(comp==1)?ycc.Cb:ycc.Cr;
+                int16_t *plane=(comp==0)?ycc.Y:(comp==1)?ycc.Cb:ycc.Cr;
                 put_block_i16(plane,W,H,bx,by,blk);
             }
         }
     }
 
-    ImageRGB rgb = ycc_to_rgb_rct(&ycc);
+    ImageRGB rgb=ycc_to_rgb_rct(&ycc);
     bmp_write_24(outbmp,&rgb);
     img_free(&rgb);
     ycc_free(&ycc);
 }
 
-static void mode1a(const char *outbmp, const char *origbmp,
-                   const char *QtYp,const char *QtCbp,const char *QtCrp,const char *dimp,
-                   const char *qFYp,const char *qFCbp,const char *qFCrp)
-{
-    int W,H;
-    FILE *fd=fopen(dimp,"r"); if(!fd) die("dim.txt");
-    if(fscanf(fd,"%d %d",&W,&H)!=2) die("dim parse");
-    fclose(fd);
-
-    int qtY[8][8], qtCb[8][8], qtCr[8][8];
-    read_qt_txt(QtYp,qtY);
-    read_qt_txt(QtCbp,qtCb);
-    read_qt_txt(QtCrp,qtCr); (void)qtCr; // same as qtCb expected
-
-    FILE *fqY=fopen(qFYp,"rb"); if(!fqY) die("qF_Y");
-    FILE *fqCb=fopen(qFCbp,"rb"); if(!fqCb) die("qF_Cb");
-    FILE *fqCr=fopen(qFCrp,"rb"); if(!fqCr) die("qF_Cr");
-
-    decode_from_qf(outbmp,W,H,qtY,qtCb,fqY,fqCb,fqCr,NULL,NULL,NULL,0);
-
-    fclose(fqY); fclose(fqCb); fclose(fqCr);
-
-    ImageRGB orig=bmp_read_24(origbmp);
-    ImageRGB rec =bmp_read_24(outbmp);
-    print_pixel_sqnr_rgb(&orig,&rec);
-    img_free(&orig); img_free(&rec);
-}
-
-static void mode1b(const char *outbmp,
-                   const char *QtYp,const char *QtCbp,const char *QtCrp,const char *dimp,
-                   const char *qFYp,const char *qFCbp,const char *qFCrp,
-                   const char *eFYp,const char *eFCbp,const char *eFCrp)
-{
-    int W,H;
-    FILE *fd=fopen(dimp,"r"); if(!fd) die("dim.txt");
-    if(fscanf(fd,"%d %d",&W,&H)!=2) die("dim parse");
-    fclose(fd);
-
-    int qtY[8][8], qtCb[8][8], qtCr[8][8];
-    read_qt_txt(QtYp,qtY);
-    read_qt_txt(QtCbp,qtCb);
-    read_qt_txt(QtCrp,qtCr); (void)qtCr;
-
-    FILE *fqY=fopen(qFYp,"rb"); if(!fqY) die("qF_Y");
-    FILE *fqCb=fopen(qFCbp,"rb"); if(!fqCb) die("qF_Cb");
-    FILE *fqCr=fopen(qFCrp,"rb"); if(!fqCr) die("qF_Cr");
-
-    FILE *feY=fopen(eFYp,"rb"); if(!feY) die("eF_Y");
-    FILE *feCb=fopen(eFCbp,"rb"); if(!feCb) die("eF_Cb");
-    FILE *feCr=fopen(eFCrp,"rb"); if(!feCr) die("eF_Cr");
-
-    decode_from_qf(outbmp,W,H,qtY,qtCb,fqY,fqCb,fqCr,feY,feCb,feCr,1);
-
-    fclose(fqY); fclose(fqCb); fclose(fqCr);
-    fclose(feY); fclose(feCb); fclose(feCr);
-}
-
-// ---------------- Mode 2: decode RLE -> rebuild qF -> QRes ----------------
+// ---------- Mode 2 & 3 shared: RLE pair ----------
 typedef struct { uint8_t skip; int16_t val; } Pair;
 
-static void rle_to_zz(int16_t zz[64], const Pair *pairs, int npairs){
+static void rle_pairs_to_zz(int16_t zz[64], const Pair *pairs, int npairs){
     memset(zz,0,64*sizeof(int16_t));
     int k=0;
     for(int i=0;i<npairs;i++){
-        k += pairs[i].skip;
+        k += (int)pairs[i].skip;
         if(k>=64) break;
         zz[k]=pairs[i].val;
         k++;
@@ -367,38 +323,27 @@ static void rle_to_zz(int16_t zz[64], const Pair *pairs, int npairs){
 
 static void inv_dpcm_dc(int16_t zz[64], int16_t *prevDC){
     int16_t diff=zz[0];
-    int16_t dc = (int16_t)(diff + *prevDC);
+    int16_t dc=(int16_t)(diff + *prevDC);
     zz[0]=dc;
     *prevDC=dc;
 }
 
-static void reconstruct_qres_from_pairs(const char *outbmp, int W,int H,
+static void reconstruct_from_rle_blocks(const char *outbmp, int W,int H,
                                        const int qtY[8][8], const int qtC[8][8],
-                                       const Pair *Yp,int nY, const Pair *Cbp,int nCb, const Pair *Crp,int nCr)
-{
-    // We stored flat streams (Y then Cb then Cr). Need to know how to split into blocks.
-    // Here we assume encoder wrote Y pairs for all blocks in order, then Cb then Cr,
-    // BUT without per-block boundaries, we cannot decode uniquely.
-    // Therefore, for mode2 ASCII we decode per-line (block boundary explicit).
-    // For mode2 binary in our encoder design, we stored flat arrays too (not per block).
-    // -> To keep decoder correct, we will ONLY support ASCII mode2 fully and binary mode2 for our own format:
-    //    binary stores three flat arrays but ALSO requires block delimiters; not present.
-    // So: we won’t call this for binary; instead implement ASCII parser per-block below.
-    (void)outbmp;(void)W;(void)H;(void)qtY;(void)qtC;(void)Yp;(void)nY;(void)Cbp;(void)nCb;(void)Crp;(void)nCr;
-    die("Internal: binary flat pairs not decodable without per-block delimiters. Use ASCII mode2.");
+                                       int nbx,int nby,
+                                       FILE *get_next_block_pairs, int is_dummy) {
+    (void)outbmp; (void)W; (void)H; (void)qtY; (void)qtC; (void)nbx; (void)nby; (void)get_next_block_pairs; (void)is_dummy;
+    // placeholder (not used)
 }
 
+// ---------- Mode 2 decode ASCII ----------
 static void mode2_ascii(const char *outbmp, const char *txtpath){
     FILE *fp=fopen(txtpath,"r"); if(!fp) die("open rle_code.txt");
     int W,H;
     if(fscanf(fp,"%d %d",&W,&H)!=2) die("size row");
     int nbx=(W+7)/8, nby=(H+7)/8;
 
-    // read QT from default (must match encoder's fixed tables)
-    // If your course wants QT saved/loaded here, add file args; spec for mode2 doesn't include Qt paths.
-    extern const int QT_Y_STD[8][8];
-    extern const int QT_C_STD[8][8];
-    // Can't extern across file; re-define here:
+    // QT must match encoder’s fixed QT (mode2 spec doesn’t pass Qt files)
     static const int qtY[8][8]={
      {16,11,10,16,24,40,51,61},{12,12,14,19,26,58,60,55},{14,13,16,24,40,57,69,56},{14,17,22,29,51,87,80,62},
      {18,22,37,56,68,109,103,77},{24,35,55,64,81,104,113,92},{49,64,78,87,103,121,120,101},{72,92,95,98,112,100,103,99}
@@ -408,6 +353,10 @@ static void mode2_ascii(const char *outbmp, const char *txtpath){
      {99,99,99,99,99,99,99,99},{99,99,99,99,99,99,99,99},{99,99,99,99,99,99,99,99},{99,99,99,99,99,99,99,99}
     };
 
+    // consume rest of first line
+    char line[1<<16];
+    fgets(line,sizeof(line),fp);
+
     ImageYCCi ycc; ycc.w=W; ycc.h=H;
     size_t n=(size_t)W*H;
     ycc.Y =(int16_t*)calloc(n,sizeof(int16_t));
@@ -415,59 +364,44 @@ static void mode2_ascii(const char *outbmp, const char *txtpath){
     ycc.Cr=(int16_t*)calloc(n,sizeof(int16_t));
     if(!ycc.Y||!ycc.Cb||!ycc.Cr) die("OOM");
 
-    char line[1<<16];
-    int16_t prevY=0, prevCb=0, prevCr=0;
-
-    // after reading first line with fscanf, we are at end of it; consume rest of line
-    fgets(line,sizeof(line),fp);
+    int16_t prevDC[3]={0,0,0};
 
     for(int by=0;by<nby;by++){
         for(int bx=0;bx<nbx;bx++){
             for(int comp=0;comp<3;comp++){
-                if(!fgets(line,sizeof(line),fp)) die("unexpected EOF in rle_code.txt");
+                if(!fgets(line,sizeof(line),fp)) die("EOF rle_code.txt");
+                // format: (m,n, X) skip val skip val ...
+                char *p=strchr(line,')');
+                if(!p) die("bad rle line");
+                p++;
 
-                // parse header "(m,n, X)" then pairs
-                // We ignore m,n in file and use loop order.
-                char *p=line;
-                // find ')'
-                char *rp=strchr(p,')');
-                if(!rp) die("bad line format");
-                p=rp+1;
-
-                // parse pairs: skip value ...
                 Pair pairs[256]; int np=0;
                 while(1){
-                    unsigned sk; int val;
                     while(*p==' '||*p=='\t') p++;
-                    if(*p=='\0'||*p=='\n') break;
-                    if(sscanf(p,"%u %d",&sk,&val)!=2) break;
-                    pairs[np].skip=(uint8_t)sk;
+                    if(*p=='\0'||*p=='\n'||*p=='\r') break;
+                    int skip,val;
+                    if(sscanf(p,"%d %d",&skip,&val)!=2) break;
+                    pairs[np].skip=(uint8_t)skip;
                     pairs[np].val=(int16_t)val;
                     np++;
-                    // advance p to after two ints
-                    // crude: move to next after reading
-                    // skip first int
-                    while(*p && *p!=' ' && *p!='\t' && *p!='\n') p++;
+
+                    // advance p twice
+                    while(*p && *p!=' ' && *p!='\t' && *p!='\n' && *p!='\r') p++;
                     while(*p==' '||*p=='\t') p++;
-                    while(*p && *p!=' ' && *p!='\t' && *p!='\n') p++;
+                    while(*p && *p!=' ' && *p!='\t' && *p!='\n' && *p!='\r') p++;
                 }
 
-                int16_t zz[64];
-                rle_to_zz(zz,pairs,np);
+                int16_t zz[64]; rle_pairs_to_zz(zz,pairs,np);
+                inv_dpcm_dc(zz, &prevDC[comp]);
 
-                int16_t *prev = (comp==0)?&prevY:(comp==1)?&prevCb:&prevCr;
-                inv_dpcm_dc(zz, prev);
+                int16_t qblk[8][8]; zz_to_block(zz,qblk);
 
-                int16_t qblk[8][8];
-                zz_to_block(zz, qblk);
-
-                // dequant -> IDCT -> block spatial
-                double F[8][8];
                 const int (*qt)[8]=(comp==0)?qtY:qtC;
+                double F[8][8];
                 for(int u=0;u<8;u++) for(int v=0;v<8;v++) F[u][v]=(double)qblk[u][v]*(double)qt[u][v];
 
                 double blk[8][8];
-                idct8x8(F, blk);
+                idct8x8(F,blk);
 
                 int16_t *plane=(comp==0)?ycc.Y:(comp==1)?ycc.Cb:ycc.Cr;
                 put_block_i16(plane,W,H,bx,by,blk);
@@ -476,38 +410,89 @@ static void mode2_ascii(const char *outbmp, const char *txtpath){
     }
 
     fclose(fp);
-
     ImageRGB rgb=ycc_to_rgb_rct(&ycc);
     bmp_write_24(outbmp,&rgb);
     img_free(&rgb);
     ycc_free(&ycc);
 }
 
-static void mode2(const char *outbmp, const char *fmt, const char *path){
-    if(strcmp(fmt,"ascii")==0){
-        mode2_ascii(outbmp,path);
-    } else if(strcmp(fmt,"binary")==0){
-        die("This decoder version fully supports mode2 ASCII per spec. If you need binary mode2 too, tell me and I’ll extend it by storing per-block delimiters in rle_code.bin.");
-    } else die("mode2 fmt must be ascii|binary");
+// ---------- Mode 2 decode Binary (our format) ----------
+static void mode2_binary(const char *outbmp, const char *binpath){
+    FILE *fp=fopen(binpath,"rb"); if(!fp) die("open rle_code.bin");
+    uint32_t W,H,nbx,nby;
+    if(fread(&W,4,1,fp)!=1) die("bin read W");
+    if(fread(&H,4,1,fp)!=1) die("bin read H");
+    if(fread(&nbx,4,1,fp)!=1) die("bin read nbx");
+    if(fread(&nby,4,1,fp)!=1) die("bin read nby");
+
+    static const int qtY[8][8]={
+     {16,11,10,16,24,40,51,61},{12,12,14,19,26,58,60,55},{14,13,16,24,40,57,69,56},{14,17,22,29,51,87,80,62},
+     {18,22,37,56,68,109,103,77},{24,35,55,64,81,104,113,92},{49,64,78,87,103,121,120,101},{72,92,95,98,112,100,103,99}
+    };
+    static const int qtC[8][8]={
+     {17,18,24,47,99,99,99,99},{18,21,26,66,99,99,99,99},{24,26,56,99,99,99,99,99},{47,66,99,99,99,99,99,99},
+     {99,99,99,99,99,99,99,99},{99,99,99,99,99,99,99,99},{99,99,99,99,99,99,99,99},{99,99,99,99,99,99,99,99}
+    };
+
+    ImageYCCi ycc; ycc.w=(int)W; ycc.h=(int)H;
+    size_t n=(size_t)W*H;
+    ycc.Y =(int16_t*)calloc(n,sizeof(int16_t));
+    ycc.Cb=(int16_t*)calloc(n,sizeof(int16_t));
+    ycc.Cr=(int16_t*)calloc(n,sizeof(int16_t));
+    if(!ycc.Y||!ycc.Cb||!ycc.Cr) die("OOM");
+
+    int16_t prevDC[3]={0,0,0};
+
+    for(uint32_t by=0;by<nby;by++){
+        for(uint32_t bx=0;bx<nbx;bx++){
+            for(int comp=0;comp<3;comp++){
+                uint16_t np;
+                if(fread(&np,2,1,fp)!=1) die("bin read npairs");
+                Pair pairs[256]; if(np>256) die("npairs too big");
+                for(uint16_t i=0;i<np;i++){
+                    if(fread(&pairs[i].skip,1,1,fp)!=1) die("bin read skip");
+                    if(fread(&pairs[i].val,2,1,fp)!=1) die("bin read val");
+                }
+
+                int16_t zz[64]; rle_pairs_to_zz(zz,pairs,(int)np);
+                inv_dpcm_dc(zz, &prevDC[comp]);
+
+                int16_t qblk[8][8]; zz_to_block(zz,qblk);
+
+                const int (*qt)[8]=(comp==0)?qtY:qtC;
+                double F[8][8];
+                for(int u=0;u<8;u++) for(int v=0;v<8;v++) F[u][v]=(double)qblk[u][v]*(double)qt[u][v];
+
+                double blk[8][8];
+                idct8x8(F,blk);
+
+                int16_t *plane=(comp==0)?ycc.Y:(comp==1)?ycc.Cb:ycc.Cr;
+                put_block_i16(plane,(int)W,(int)H,(int)bx,(int)by,blk);
+            }
+        }
+    }
+
+    fclose(fp);
+    ImageRGB rgb=ycc_to_rgb_rct(&ycc);
+    bmp_write_24(outbmp,&rgb);
+    img_free(&rgb);
+    ycc_free(&ycc);
 }
 
-// ---------------- Mode 3: Huffman decode ----------------
-// We decode using codebook.txt + (txt lines of 0/1 per symbol) or (bin bitstream)
-// For simplicity and robustness, ASCII mode stores one symbol per line => no bit parsing needed.
-
-typedef struct Node {
+// ---------- Huffman decode (Mode 3) ----------
+typedef struct HNode {
     int leaf;
     uint32_t sym;
-    struct Node *l,*r;
+    struct HNode *l,*r;
 } HNode;
 
-static HNode* hn_new(){ HNode* n=(HNode*)calloc(1,sizeof(HNode)); if(!n) die("OOM"); return n; }
-static void hn_free(HNode* n){ if(!n) return; hn_free(n->l); hn_free(n->r); free(n); }
+static HNode* hn_new(void){ HNode *n=(HNode*)calloc(1,sizeof(HNode)); if(!n) die("OOM"); return n; }
+static void hn_free(HNode *n){ if(!n) return; hn_free(n->l); hn_free(n->r); free(n); }
 
 static void insert_code(HNode *root, const char *bits, uint32_t sym){
     HNode *cur=root;
     for(const char *p=bits; *p; p++){
-        if(*p=='\n' || *p=='\r') break;
+        if(*p=='\n'||*p=='\r') break;
         if(*p=='0'){
             if(!cur->l) cur->l=hn_new();
             cur=cur->l;
@@ -521,7 +506,7 @@ static void insert_code(HNode *root, const char *bits, uint32_t sym){
 }
 
 static HNode* build_tree_from_codebook(const char *codebook){
-    FILE *fp=fopen(codebook,"r"); if(!fp) die("open codebook");
+    FILE *fp=fopen(codebook,"r"); if(!fp) die("open codebook.txt");
     char line[4096];
     HNode *root=hn_new();
     while(fgets(line,sizeof(line),fp)){
@@ -537,17 +522,68 @@ static HNode* build_tree_from_codebook(const char *codebook){
     return root;
 }
 
+static int next_symbol_from_ascii(FILE *fp, HNode *root, uint32_t *sym){
+    char line[4096];
+    if(!fgets(line,sizeof(line),fp)) return 0;
+    HNode *cur=root;
+    for(char *p=line; *p; p++){
+        if(*p=='0') cur=cur->l;
+        else if(*p=='1') cur=cur->r;
+        else if(*p=='\n'||*p=='\r') break;
+        if(!cur) die("bad huffman codeword");
+    }
+    if(!cur->leaf) die("non-leaf codeword");
+    *sym=cur->sym;
+    return 1;
+}
+
+typedef struct {
+    FILE *fp;
+    uint8_t cur;
+    int bits_left;
+    uint64_t nbits_total;
+    uint64_t nbits_used;
+} BitReader;
+
+static void br_init(BitReader *br, FILE *fp, uint64_t nbits){
+    br->fp=fp; br->cur=0; br->bits_left=0; br->nbits_total=nbits; br->nbits_used=0;
+}
+static int br_getbit(BitReader *br, int *bit){
+    if(br->nbits_used >= br->nbits_total) return 0;
+    if(br->bits_left==0){
+        int c=fgetc(br->fp);
+        if(c==EOF) die("unexpected EOF in bitstream");
+        br->cur=(uint8_t)c;
+        br->bits_left=8;
+    }
+    int b=(br->cur & 0x80)?1:0;
+    br->cur <<= 1;
+    br->bits_left--;
+    br->nbits_used++;
+    *bit=b;
+    return 1;
+}
+
+static int next_symbol_from_bits(BitReader *br, HNode *root, uint32_t *sym){
+    HNode *cur=root;
+    while(cur && !cur->leaf){
+        int b;
+        if(!br_getbit(br,&b)) return 0;
+        cur = (b==0)?cur->l:cur->r;
+    }
+    if(!cur) die("invalid huffman path");
+    *sym=cur->sym;
+    return 1;
+}
+
 static void mode3_ascii(const char *outbmp, const char *codebook, const char *hufftxt){
     HNode *root=build_tree_from_codebook(codebook);
+    FILE *fp=fopen(hufftxt,"r"); if(!fp) die("open huffman_code.txt");
 
-    FILE *fp=fopen(hufftxt,"r"); if(!fp) die("huffman_code.txt");
     int W,H;
-    if(fscanf(fp,"%d %d",&W,&H)!=2) die("huff size row");
-    char line[4096];
-    fgets(line,sizeof(line),fp); // consume rest
+    if(fscanf(fp,"%d %d",&W,&H)!=2) die("huffman txt size row");
+    char tmp[256]; fgets(tmp,sizeof(tmp),fp);
 
-    // decode stream: one symbol per line, but line is already codeword; we traverse tree and should end in leaf
-    // We will reconstruct QRes same as mode2 ASCII pipeline (default QT).
     static const int qtY[8][8]={
      {16,11,10,16,24,40,51,61},{12,12,14,19,26,58,60,55},{14,13,16,24,40,57,69,56},{14,17,22,29,51,87,80,62},
      {18,22,37,56,68,109,103,77},{24,35,55,64,81,104,113,92},{49,64,78,87,103,121,120,101},{72,92,95,98,112,100,103,99}
@@ -566,56 +602,30 @@ static void mode3_ascii(const char *outbmp, const char *codebook, const char *hu
     ycc.Cr=(int16_t*)calloc(n,sizeof(int16_t));
     if(!ycc.Y||!ycc.Cb||!ycc.Cr) die("OOM");
 
-    int16_t prevY=0, prevCb=0, prevCr=0;
-
-    // For each block/channel, we need to rebuild RLE pairs until we have 64 slots filled.
-    // But encoder3 used symbol stream of (skip,val) pairs concatenated without block delimiters.
-    // => To make decoding deterministic, we rely on the rule:
-    //    pairs are consumed and applied to a 64-length sequence; when sequence cursor reaches 64 => one block done.
-    // This matches encoder2/3 RLE definition.
-    auto int next_symbol(uint32_t *sym){
-        if(!fgets(line,sizeof(line),fp)) return 0;
-        // traverse tree
-        HNode *cur=root;
-        for(char *p=line; *p; p++){
-            if(*p=='0') cur=cur->l;
-            else if(*p=='1') cur=cur->r;
-            if(!cur) die("bad codeword");
-        }
-        if(!cur->leaf) die("non-leaf code");
-        *sym=cur->sym;
-        return 1;
-    }
+    int16_t prevDC[3]={0,0,0};
 
     for(int by=0;by<nby;by++){
         for(int bx=0;bx<nbx;bx++){
             for(int comp=0;comp<3;comp++){
                 int16_t zz[64]={0};
                 int k=0;
-
                 while(k<64){
                     uint32_t sym;
-                    if(!next_symbol(&sym)) die("EOF too early in huffman_code.txt");
+                    if(!next_symbol_from_ascii(fp,root,&sym)) die("EOF huffman symbols");
                     uint8_t skip=(uint8_t)(sym>>16);
                     int16_t val =(int16_t)(uint16_t)(sym & 0xFFFFu);
-                    k += skip;
+                    k += (int)skip;
                     if(k>=64) break;
                     zz[k]=val;
                     k++;
                 }
 
-                int16_t *prev=(comp==0)?&prevY:(comp==1)?&prevCb:&prevCr;
-                // inv DPCM
-                int16_t diff=zz[0];
-                int16_t dc=(int16_t)(diff + *prev);
-                zz[0]=dc;
-                *prev=dc;
+                inv_dpcm_dc(zz,&prevDC[comp]);
 
-                int16_t qblk[8][8];
-                zz_to_block(zz,qblk);
+                int16_t qblk[8][8]; zz_to_block(zz,qblk);
+                const int (*qt)[8]=(comp==0)?qtY:qtC;
 
                 double F[8][8];
-                const int (*qt)[8]=(comp==0)?qtY:qtC;
                 for(int u=0;u<8;u++) for(int v=0;v<8;v++) F[u][v]=(double)qblk[u][v]*(double)qt[u][v];
 
                 double blk[8][8];
@@ -637,17 +647,155 @@ static void mode3_ascii(const char *outbmp, const char *codebook, const char *hu
 }
 
 static void mode3_binary(const char *outbmp, const char *codebook, const char *huffbin){
-    die("mode3 binary decode is doable but longer. If你確定要交 binary 版 decoder，我下一則直接把 binary bitstream 解析補齊（會用 codebook tree 一bit一bit走）。");
+    HNode *root=build_tree_from_codebook(codebook);
+    FILE *fp=fopen(huffbin,"rb"); if(!fp) die("open huffman_code.bin");
+
+    uint32_t W,H;
+    uint64_t nbits;
+    if(fread(&W,4,1,fp)!=1) die("read W");
+    if(fread(&H,4,1,fp)!=1) die("read H");
+    if(fread(&nbits,8,1,fp)!=1) die("read nbits");
+
+    static const int qtY[8][8]={
+     {16,11,10,16,24,40,51,61},{12,12,14,19,26,58,60,55},{14,13,16,24,40,57,69,56},{14,17,22,29,51,87,80,62},
+     {18,22,37,56,68,109,103,77},{24,35,55,64,81,104,113,92},{49,64,78,87,103,121,120,101},{72,92,95,98,112,100,103,99}
+    };
+    static const int qtC[8][8]={
+     {17,18,24,47,99,99,99,99},{18,21,26,66,99,99,99,99},{24,26,56,99,99,99,99,99},{47,66,99,99,99,99,99,99},
+     {99,99,99,99,99,99,99,99},{99,99,99,99,99,99,99,99},{99,99,99,99,99,99,99,99},{99,99,99,99,99,99,99,99}
+    };
+
+    int nbx=((int)W+7)/8, nby=((int)H+7)/8;
+
+    ImageYCCi ycc; ycc.w=(int)W; ycc.h=(int)H;
+    size_t n=(size_t)W*H;
+    ycc.Y =(int16_t*)calloc(n,sizeof(int16_t));
+    ycc.Cb=(int16_t*)calloc(n,sizeof(int16_t));
+    ycc.Cr=(int16_t*)calloc(n,sizeof(int16_t));
+    if(!ycc.Y||!ycc.Cb||!ycc.Cr) die("OOM");
+
+    BitReader br; br_init(&br,fp,nbits);
+    int16_t prevDC[3]={0,0,0};
+
+    for(int by=0;by<nby;by++){
+        for(int bx=0;bx<nbx;bx++){
+            for(int comp=0;comp<3;comp++){
+                int16_t zz[64]={0};
+                int k=0;
+                while(k<64){
+                    uint32_t sym;
+                    if(!next_symbol_from_bits(&br,root,&sym)) die("EOF bitstream too early");
+                    uint8_t skip=(uint8_t)(sym>>16);
+                    int16_t val =(int16_t)(uint16_t)(sym & 0xFFFFu);
+                    k += (int)skip;
+                    if(k>=64) break;
+                    zz[k]=val;
+                    k++;
+                }
+
+                inv_dpcm_dc(zz,&prevDC[comp]);
+
+                int16_t qblk[8][8]; zz_to_block(zz,qblk);
+                const int (*qt)[8]=(comp==0)?qtY:qtC;
+
+                double F[8][8];
+                for(int u=0;u<8;u++) for(int v=0;v<8;v++) F[u][v]=(double)qblk[u][v]*(double)qt[u][v];
+
+                double blk[8][8];
+                idct8x8(F,blk);
+
+                int16_t *plane=(comp==0)?ycc.Y:(comp==1)?ycc.Cb:ycc.Cr;
+                put_block_i16(plane,(int)W,(int)H,bx,by,blk);
+            }
+        }
+    }
+
+    fclose(fp);
+    hn_free(root);
+
+    ImageRGB rgb=ycc_to_rgb_rct(&ycc);
+    bmp_write_24(outbmp,&rgb);
+    img_free(&rgb);
+    ycc_free(&ycc);
 }
 
-static void mode3(const char *outbmp, const char *fmt, const char *codebook, const char *huffpath){
-    if(strcmp(fmt,"ascii")==0) mode3_ascii(outbmp,codebook,huffpath);
-    else if(strcmp(fmt,"binary")==0) mode3_binary(outbmp,codebook,huffpath);
-    else die("mode3 fmt must be ascii|binary");
+// ---------- Mode 1 wrapper: decide 1(a) vs 1(b) by argc ----------
+static void mode1_dispatch(int argc, char **argv){
+    // 1(a): decoder 1 QRes.bmp orig.bmp QtY QtCb QtCr dim qFY qFCb qFCr   (argc == 11)
+    // 1(b): decoder 1 Res.bmp QtY QtCb QtCr dim qFY qFCb qFCr eFY eFCb eFCr (argc == 12)
+    if(argc!=11 && argc!=12) die("decoder 1: wrong args (see spec)");
+
+    const char *outbmp=argv[2];
+    int use_error = (argc==12);
+
+    const char *origbmp = use_error ? NULL : argv[3];
+
+    const char *QtYp = use_error ? argv[3] : argv[4];
+    const char *QtCbp= use_error ? argv[4] : argv[5];
+    const char *QtCrp= use_error ? argv[5] : argv[6];
+    const char *dimp = use_error ? argv[6] : argv[7];
+
+    const char *qFYp = use_error ? argv[7] : argv[8];
+    const char *qFCbp= use_error ? argv[8] : argv[9];
+    const char *qFCrp= use_error ? argv[9] : argv[10];
+
+    const char *eFYp = use_error ? argv[10] : NULL;
+    const char *eFCbp= use_error ? argv[11] : NULL;
+    const char *eFCrp= use_error ? argv[12] : NULL; // won't be used; argc==12 means argv[11] exists; but this line is safe only if argc>=13 (not)
+    // Fix indexing for argc==12:
+    if(use_error){
+        eFYp = argv[10];
+        eFCbp= argv[11];
+        eFCrp= argv[12-1]; // argv[11] is eFCb, argv[11]?? -> Actually argc==12 => argv[11] exists, argv[12] doesn't.
+        // We'll map correctly below with explicit.
+    }
+
+    // parse dim
+    int W,H;
+    FILE *fd=fopen(dimp,"r"); if(!fd) die("open dim.txt");
+    if(fscanf(fd,"%d %d",&W,&H)!=2) die("dim parse");
+    fclose(fd);
+
+    int qtY[8][8], qtCb[8][8], qtCr[8][8];
+    read_qt_txt(QtYp,qtY);
+    read_qt_txt(QtCbp,qtCb);
+    read_qt_txt(QtCrp,qtCr); (void)qtCr;
+
+    FILE *fqY=fopen(qFYp,"rb"); if(!fqY) die("open qF_Y.raw");
+    FILE *fqCb=fopen(qFCbp,"rb"); if(!fqCb) die("open qF_Cb.raw");
+    FILE *fqCr=fopen(qFCrp,"rb"); if(!fqCr) die("open qF_Cr.raw");
+
+    FILE *feY=NULL,*feCb=NULL,*feCr=NULL;
+
+    if(use_error){
+        // argc==12 layout:
+        // decoder 1 Res.bmp QtY QtCb QtCr dim qFY qFCb qFCr eFY eFCb eFCr
+        // argv indexes: 0..11
+        const char *eFY = argv[10];
+        const char *eFCb= argv[11];
+        const char *eFCr= argv[11]; // placeholder, will be fixed by requiring argc==13 ideally
+        // We can't know eFCr without having it in argv; so we enforce correct argc for 1(b):
+        die("decoder 1(b): spec needs 11 args after '1' (total argc should be 13). Please call exactly like spec.");
+    }
+
+    // For correctness, we support exactly the spec calls:
+    // 1(a) total argc = 11
+    // 1(b) total argc = 12 in your earlier text includes 11 inputs after '1' => actually total argc should be 13.
+    // So we only run 1(a) here; 1(b) implemented below with correct argc in main.
+
+    decode_mode1(outbmp,W,H,qtY,qtCb,fqY,fqCb,fqCr,NULL,NULL,NULL,0);
+    fclose(fqY); fclose(fqCb); fclose(fqCr);
+
+    ImageRGB orig=bmp_read_24(origbmp);
+    ImageRGB rec =bmp_read_24(outbmp);
+    print_pixel_sqnr_rgb(&orig,&rec);
+    img_free(&orig); img_free(&rec);
 }
 
+// ---------- main ----------
 int main(int argc, char **argv){
     if(argc<2) die("usage: decoder <mode> ...");
+
     int mode=atoi(argv[1]);
 
     if(mode==0){
@@ -655,29 +803,66 @@ int main(int argc, char **argv){
         mode0(argv[2],argv[3],argv[4],argv[5],argv[6]);
         return 0;
     }
-    // decoder 1 has two submodes: 1a / 1b
-    if(strcmp(argv[1],"1a")==0){
-        if(argc!=10) die("decoder 1a out.bmp orig.bmp QtY QtCb QtCr dim qFY qFCb qFCr");
-        mode1a(argv[2],argv[3],argv[4],argv[5],argv[6],argv[7],argv[8],argv[9],argv[10]);
-        return 0;
+
+    if(mode==1){
+        // Support spec EXACTLY:
+        // 1(a): decoder 1 QRes.bmp Kimberly.bmp QtY QtCb QtCr dim qFY qFCb qFCr  => argc = 11
+        // 1(b): decoder 1 Res.bmp QtY QtCb QtCr dim qFY qFCb qFCr eFY eFCb eFCr => argc = 12? actually: out + 10 inputs => total argc=13
+        if(argc==11){
+            mode1_dispatch(argc,argv);
+            return 0;
+        } else if(argc==12 || argc==13){
+            // implement 1(b) with correct indexing if argc==13
+            if(argc!=13) die("decoder 1(b) needs: decoder 1 Res.bmp QtY QtCb QtCr dim qFY qFCb qFCr eFY eFCb eFCr (total argc=13)");
+            const char *outbmp=argv[2];
+            const char *QtYp=argv[3], *QtCbp=argv[4], *QtCrp=argv[5], *dimp=argv[6];
+            const char *qFYp=argv[7], *qFCbp=argv[8], *qFCrp=argv[9];
+            const char *eFYp=argv[10], *eFCbp=argv[11], *eFCrp=argv[12];
+
+            int W,H;
+            FILE *fd=fopen(dimp,"r"); if(!fd) die("open dim.txt");
+            if(fscanf(fd,"%d %d",&W,&H)!=2) die("dim parse");
+            fclose(fd);
+
+            int qtY[8][8], qtCb[8][8], qtCr[8][8];
+            read_qt_txt(QtYp,qtY);
+            read_qt_txt(QtCbp,qtCb);
+            read_qt_txt(QtCrp,qtCr); (void)qtCr;
+
+            FILE *fqY=fopen(qFYp,"rb"); if(!fqY) die("open qF_Y.raw");
+            FILE *fqCb=fopen(qFCbp,"rb"); if(!fqCb) die("open qF_Cb.raw");
+            FILE *fqCr=fopen(qFCrp,"rb"); if(!fqCr) die("open qF_Cr.raw");
+
+            FILE *feY=fopen(eFYp,"rb"); if(!feY) die("open eF_Y.raw");
+            FILE *feCb=fopen(eFCbp,"rb"); if(!feCb) die("open eF_Cb.raw");
+            FILE *feCr=fopen(eFCrp,"rb"); if(!feCr) die("open eF_Cr.raw");
+
+            decode_mode1(outbmp,W,H,qtY,qtCb,fqY,fqCb,fqCr,feY,feCb,feCr,1);
+
+            fclose(fqY); fclose(fqCb); fclose(fqCr);
+            fclose(feY); fclose(feCb); fclose(feCr);
+            return 0;
+        } else {
+            die("decoder 1: wrong args");
+        }
     }
-    if(strcmp(argv[1],"1b")==0){
-        if(argc!=12) die("decoder 1b out.bmp QtY QtCb QtCr dim qFY qFCb qFCr eFY eFCb eFCr");
-        mode1b(argv[2],argv[3],argv[4],argv[5],argv[6],argv[7],argv[8],argv[9],argv[10],argv[11]);
-        return 0;
-    }
+
     if(mode==2){
         if(argc!=5) die("decoder 2 out.bmp ascii|binary rle_code.(txt|bin)");
-        mode2(argv[2],argv[3],argv[4]);
+        if(strcmp(argv[3],"ascii")==0) mode2_ascii(argv[2],argv[4]);
+        else if(strcmp(argv[3],"binary")==0) mode2_binary(argv[2],argv[4]);
+        else die("mode2 fmt must be ascii or binary");
         return 0;
     }
+
     if(mode==3){
         if(argc!=6) die("decoder 3 out.bmp ascii|binary codebook.txt huffman_code.(txt|bin)");
-        mode3(argv[2],argv[3],argv[4],argv[5]);
+        if(strcmp(argv[3],"ascii")==0) mode3_ascii(argv[2],argv[4],argv[5]);
+        else if(strcmp(argv[3],"binary")==0) mode3_binary(argv[2],argv[4],argv[5]);
+        else die("mode3 fmt must be ascii or binary");
         return 0;
     }
 
-    die("mode must be 0,2,3 or use 1a/1b");
+    die("mode must be 0..3");
     return 0;
 }
-
