@@ -96,8 +96,8 @@ static void bmp_write_24(const char *path, const ImageRGB *im){
     ih.biBitCount=24;
     ih.biCompression=0;
     ih.biSizeImage=0;
-    ih.biXPelsPerMeter = 2835;
-    ih.biYPelsPerMeter = 2835;
+    ih.biXPelsPerMeter = 3780;
+    ih.biYPelsPerMeter = 3780;
 
 
     fwrite(&fh,sizeof(fh),1,fp);
