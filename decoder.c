@@ -525,18 +525,28 @@ static HNode* build_tree_from_codebook(const char *codebook){
     return root;
 }
 
+static int read01_skipws(FILE *fp){
+    int c;
+    do{
+        c = fgetc(fp);
+        if(c == EOF) return -1;
+    }while(c==' ' || c=='\n' || c=='\r' || c=='\t');
+    if(c=='0') return 0;
+    if(c=='1') return 1;
+    return -2; // invalid char
+}
+
 static int next_symbol_from_ascii(FILE *fp, HNode *root, uint32_t *sym){
-    char line[4096];
-    if(!fgets(line,sizeof(line),fp)) return 0;
-    HNode *cur=root;
-    for(char *p=line; *p; p++){
-        if(*p=='0') cur=cur->l;
-        else if(*p=='1') cur=cur->r;
-        else if(*p=='\n'||*p=='\r') break;
-        if(!cur) die("bad huffman codeword");
+    HNode *cur = root;
+
+    while(cur && !cur->leaf){
+        int b = read01_skipws(fp);
+        if(b == -1) return 0;              // EOF: 沒有更多 bits
+        if(b == -2) die("bad char in ascii bitstream");
+        cur = (b==0) ? cur->l : cur->r;
     }
-    if(!cur->leaf) die("non-leaf codeword");
-    *sym=cur->sym;
+    if(!cur) die("invalid huffman path");
+    *sym = cur->sym;
     return 1;
 }
 
