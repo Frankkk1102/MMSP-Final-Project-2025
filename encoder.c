@@ -605,6 +605,9 @@ static void mode3(const char *bmp, const char *fmt, const char *codebook_txt, co
                         run=0;
                     }
                 }
+                /* ---- ADD THIS: explicit End-Of-Block ---- */
+                if(N >= cap) die("stream overflow (unexpected)");
+                stream[N++] = pack_sym(255, 0);
                 // note: no explicit EOB symbol; decoder stops by filling 64 slots rule
             }
         }
