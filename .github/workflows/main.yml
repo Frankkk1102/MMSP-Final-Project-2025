@@ -1,0 +1,55 @@
+name: MMSP Final Project CI
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Install build tools
+      run: sudo apt-get update && sudo apt-get install -y build-essential
+
+    - name: Build encoder / decoder
+      run: |
+        gcc -O2 -std=c11 -Wall -Wextra -pedantic encoder.c -lm -o encoder
+        gcc -O2 -std=c11 -Wall -Wextra -pedantic decoder.c -lm -o decoder
+
+    - name: Download test image
+      run: |
+        curl -L -o Kimberly.bmp https://raw.githubusercontent.com/cychiang-ntpu/mmsp-2025-final-jpeg/main/Kimberly.bmp
+
+    - name: Run Mode 0 (BMP check)
+      run: |
+        ./encoder 0 Kimberly.bmp R.txt G.txt B.txt dim.txt
+        ./decoder 0 Res0.bmp R.txt G.txt B.txt dim.txt
+        cmp Kimberly.bmp Res0.bmp
+
+    - name: Run Mode 1 (Quantization)
+      run: |
+        ./encoder 1 Kimberly.bmp Qt_Y.txt Qt_Cb.txt Qt_Cr.txt dim.txt \
+          qF_Y.raw qF_Cb.raw qF_Cr.raw eF_Y.raw eF_Cb.raw eF_Cr.raw
+        ./decoder 1 QRes1.bmp Kimberly.bmp Qt_Y.txt Qt_Cb.txt Qt_Cr.txt dim.txt \
+          qF_Y.raw qF_Cb.raw qF_Cr.raw
+
+    - name: Run Mode 3 (Huffman)
+      run: |
+        ./encoder 3 Kimberly.bmp binary codebook.txt huffman_code.bin
+        ./decoder 3 QRes3b.bmp binary codebook.txt huffman_code.bin
+        cmp QRes1.bmp QRes3b.bmp
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: mmsp-final-artifacts
+        path: |
+          *.bmp
+          *.txt
+          *.raw
+          *.bin
