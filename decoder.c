@@ -1,3 +1,6 @@
+// decoder.c (C11) — MMSP Final Project JPEG-like pipeline (Mode 0..3)
+// Build: gcc/clang -O2 -std=c11 -Wall -Wextra -pedantic -lm -o decoder decoder.c
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
