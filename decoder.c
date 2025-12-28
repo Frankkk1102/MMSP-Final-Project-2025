@@ -8,9 +8,21 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* ---------------------------------------------
+-die()：統一錯誤處理並終止程式
+- clampi()：將整數限制在 [lo, hi]，避免像素回寫時溢位
+--------------------------------------------- */
+
 static void die(const char *msg){ fprintf(stderr,"Error: %s\n", msg); exit(1); }
 static int clampi(int v,int lo,int hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
 
+/* -------------------------------------
+BMP 讀寫（只支援 24-bit、無壓縮）：
+     - 解析 BMP 檔頭 BFH/BIH
+     - 處理 BMP 由下往上存（height > 0）
+     - 處理每列 4-byte 對齊 padding
+     檔案內是 BGR，但記憶體內統一用 RGB 存
+------------------------------------- */
 // ---------- BMP 24-bit uncompressed ----------
 #pragma pack(push,1)
 typedef struct {
@@ -38,6 +50,7 @@ typedef struct {
 
 typedef struct { int w,h; uint8_t *rgb; } ImageRGB;
 
+//讀取 24-bit BMP 成 ImageRGB（記憶體內為 RGB 順序）
 static ImageRGB bmp_read_24(const char *path){
     FILE *fp=fopen(path,"rb"); if(!fp) die("cannot open bmp");
     BFH fh; BIH ih;
@@ -73,6 +86,7 @@ static ImageRGB bmp_read_24(const char *path){
     return im;
 }
 
+// 將 ImageRGB 輸出成 24-bit BMP（bottom-up 格式）。
 static void bmp_write_24(const char *path, const ImageRGB *im){
     FILE *fp=fopen(path,"wb"); if(!fp) die("cannot write bmp");
 
@@ -114,6 +128,14 @@ static void bmp_write_24(const char *path, const ImageRGB *im){
 
 static void img_free(ImageRGB *im){ free(im->rgb); im->rgb=NULL; }
 
+/* ------------------------------------------------------
+   可逆色彩轉換（RCT）的反轉：是一種整數可逆轉換（理論上可做無損）。
+     由 (Y, Cb, Cr) 還原 (R, G, B)：
+       G = Y - ((Cb + Cr) >> 2)
+       R = Cr + G
+       B = Cb + G
+     最後把像素值限制在 [0,255]。
+------------------------------------------------------ */
 // ---------- Reversible Color Transform inverse ----------
 typedef struct { int w,h; int16_t *Y,*Cb,*Cr; } ImageYCCi;
 
@@ -137,6 +159,12 @@ static ImageRGB ycc_to_rgb_rct(const ImageYCCi *ycc){
 
 static void ycc_free(ImageYCCi *im){ free(im->Y); free(im->Cb); free(im->Cr); im->Y=im->Cb=im->Cr=NULL; }
 
+/* ---------------------------------------------
+   8x8 反離散餘弦轉換（IDCT）：
+   把頻域係數 F(u,v) 還原成空間域 8x8 區塊。
+   使用標準 IDCT 公式（含 cu/cv 正規化與 cos 項）。
+   輸出為 double，最後再四捨五入成 int16_t。
+--------------------------------------------- */
 // ---------- DCT/IDCT ----------
 static void idct8x8(const double in[8][8], double out[8][8]){
     for(int x=0;x<8;x++){
@@ -156,6 +184,11 @@ static void idct8x8(const double in[8][8], double out[8][8]){
     }
 }
 
+/* ---------------------------------------------
+   從文字檔讀取 8x8 量化表（QT）。
+   Mode 1 用它做反量化：
+   F(u,v) = q(u,v) * QT(u,v)（可加上 error term）
+--------------------------------------------- */
 // ---------- QT read ----------
 static void read_qt_txt(const char *path, int qt[8][8]){
     FILE *fp=fopen(path,"r"); if(!fp) die("open Qt txt");
@@ -166,7 +199,11 @@ static void read_qt_txt(const char *path, int qt[8][8]){
     }
     fclose(fp);
 }
-
+/* -------------------------------------------------------
+   反 Zigzag 映射：
+   Encoder 用 zigzag 順序把 8x8 係數掃成 64 長度，讓高頻零更集中。
+   這裡把 zigzag[64] 還原成 8x8 係數矩陣。
+------------------------------------------------------- */
 // ---------- ZigZag inverse ----------
 static const uint8_t ZZ[64]={
  0,1,8,16,9,2,3,10,
@@ -184,6 +221,10 @@ static void zz_to_block(const int16_t in[64], int16_t b[8][8]){
     for(int i=0;i<8;i++) for(int j=0;j<8;j++) b[i][j]=tmp[i*8+j];
 }
 
+/* -------------------------------------------------------
+   把 8x8 區塊寫回整張影像平面（Y/Cb/Cr）。
+   會處理邊界情況（影像寬高不是 8 的倍數時，超出部分跳過）。
+------------------------------------------------------- */
 // ---------- Put block into plane ----------
 static void put_block_i16(int16_t *plane,int w,int h,int bx,int by,const double blk[8][8]){
     int x0=bx*8, y0=by*8;
@@ -197,6 +238,14 @@ static void put_block_i16(int16_t *plane,int w,int h,int bx,int by,const double 
     }
 }
 
+/* -------------------------------------
+   Mode 0：
+     輸入：R.txt, G.txt, B.txt, dim.txt
+     - dim.txt 讀取寬高
+     - 逐像素讀入 R/G/B
+     - 合併成 RGB 圖並輸出 BMP
+     通常用 cmp 驗證是否完全一致（無損）。
+------------------------------------- */
 // ---------- Mode 0 ----------
 static void mode0(const char *outbmp, const char *Rt, const char *Gt, const char *Bt, const char *dim){
     int W,H;
@@ -228,6 +277,11 @@ static void mode0(const char *outbmp, const char *Rt, const char *Gt, const char
     img_free(&im);
 }
 
+/* -------------------------------------------------------
+   RGB Pixel SQNR：
+   SQNR = 10*log10( Σ(signal^2) / Σ(error^2) )
+   用來量化重建品質（Mode 1 會用到）。
+------------------------------------------------------- */
 // ---------- Pixel SQNR (RGB) ----------
 static void print_pixel_sqnr_rgb(const ImageRGB *orig, const ImageRGB *rec){
     double sig[3]={0}, err[3]={0};
@@ -247,6 +301,16 @@ static void print_pixel_sqnr_rgb(const ImageRGB *orig, const ImageRGB *rec){
     }
 }
 
+/* -------------------------------------------------------
+   Mode 1 解碼：
+     對每個 8x8 block、每個分量 (Y/Cb/Cr)：
+       1) 讀 qF（量化後係數，int16）
+       2) 可選：讀 eF（error feedback，float）
+       3) 反量化：F = qF * QT（可再加 eF）
+       4) IDCT 得到空間域 block
+       5) 寫回 Y/Cb/Cr 平面
+     最後做 inverse RCT 得到 RGB 並輸出 BMP。
+------------------------------------------------------- */
 // ---------- Mode 1 decode from qF (+ optional eF) ----------
 static void decode_mode1(const char *outbmp,
                          int W,int H,
@@ -305,7 +369,13 @@ static void decode_mode1(const char *outbmp,
     img_free(&rgb);
     ycc_free(&ycc);
 }
-
+/* -------------------------------------------------------
+   Mode 2/3 共用的 RLE 工具：
+     - Pair(skip, val)：skip 表示前面有幾個 0，接著放 val
+     - rle_pairs_to_zz()：把 pairs 展開成 zigzag[64]
+     - inv_dpcm_dc()：用 DC 差分（DPCM）還原 DC
+       dc = prevDC + diff
+------------------------------------------------------- */
 // ---------- Mode 2 & 3 shared: RLE pair ----------
 typedef struct { uint8_t skip; int16_t val; } Pair;
 
@@ -336,6 +406,16 @@ static void reconstruct_from_rle_blocks(const char *outbmp, int W,int H,
     // placeholder (not used)
 }
 
+/* -------------------------------------------------------
+   Mode 2（ASCII）：
+     rle_code.txt 格式：
+       - 第一行：W H
+       - 接著每個 block、每個分量一行：
+         "(m,n,X) skip val skip val ..."
+     流程：
+       RLE 展開 -> 還原 DC DPCM -> 反 zigzag -> 反量化 -> IDCT
+     Mode 2 的 QT 依規格使用固定常數（不由檔案傳入）。
+------------------------------------------------------- */
 // ---------- Mode 2 decode ASCII ----------
 static void mode2_ascii(const char *outbmp, const char *txtpath){
     FILE *fp=fopen(txtpath,"r"); if(!fp) die("open rle_code.txt");
@@ -416,6 +496,14 @@ static void mode2_ascii(const char *outbmp, const char *txtpath){
     ycc_free(&ycc);
 }
 
+/* -------------------------------------------------------
+   Mode 2（Binary）：
+     rle_code.bin 開頭包含：
+       W, H, nbx, nby
+     每個 block、每個分量：
+       uint16 npairs，接著 npairs 組 (uint8 skip, int16 val)
+     後續重建流程與 ASCII 相同。
+------------------------------------------------------- */
 // ---------- Mode 2 decode Binary (our format) ----------
 static void mode2_binary(const char *outbmp, const char *binpath){
     FILE *fp=fopen(binpath,"rb"); if(!fp) die("open rle_code.bin");
@@ -479,6 +567,15 @@ static void mode2_binary(const char *outbmp, const char *binpath){
     ycc_free(&ycc);
 }
 
+/* ------------------------------------------------------------
+   Mode 3 Huffman 解碼：
+     - 由 codebook.txt 建 Huffman 解碼樹
+       每行把 (skip, val, count) 對應到 bitstring
+     - 解碼符號串（ASCII 的 '0'/'1' 或 binary packed bits）
+     - 每個 symbol 表示 (skip,val)，可逐步重建 zigzag[64]
+     - 接著：還原 DC DPCM -> 反 zigzag -> 反量化 -> IDCT -> 寫回平面
+     - 最後 inverse RCT 得到 RGB，輸出 BMP
+------------------------------------------------------------ */
 // ---------- Huffman decode (Mode 3) ----------
 typedef struct HNode {
     int leaf;
@@ -802,6 +899,12 @@ static void mode1_dispatch(int argc, char **argv){
     img_free(&orig); img_free(&rec);
 }
 
+/* ------------------------------------------------------------
+   decoder 0 out.bmp R.txt G.txt B.txt dim.txt
+   decoder 1 ...（分為無 error / 有 error feedback 兩種）
+   decoder 2 out.bmp ascii|binary rle_code.(txt|bin)
+   decoder 3 out.bmp ascii|binary codebook.txt huffman_code.(txt|bin)
+------------------------------------------------------------ */
 // ---------- main ----------
 int main(int argc, char **argv){
     if(argc<2) die("usage: decoder <mode> ...");
