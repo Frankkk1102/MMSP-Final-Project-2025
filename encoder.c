@@ -8,9 +8,20 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* -----------------------------
+- die()：統一錯誤處理並終止
+- clampi()：將整數限制在 [lo, hi]
+----------------------------- */
+
 static void die(const char *msg){ fprintf(stderr,"Error: %s\n", msg); exit(1); }
 static int clampi(int v,int lo,int hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
 
+/* ------------------------------------------
+   BMP 24-bit 無壓縮讀寫：
+     - 只支援 24-bit、無壓縮 BMP
+     - 處理 bottom-up 存法與每列 4-byte padding
+     - 記憶體用 RGB，檔案用 BGR
+------------------------------------------ */
 // ---------- BMP 24-bit uncompressed ----------
 #pragma pack(push,1)
 typedef struct {
@@ -38,6 +49,7 @@ typedef struct {
 
 typedef struct { int w,h; uint8_t *rgb; } ImageRGB;
 
+//讀 BMP 成 ImageRGB（記憶體內 RGB）。
 static ImageRGB bmp_read_24(const char *path){
     FILE *fp=fopen(path,"rb"); if(!fp) die("cannot open bmp");
     BFH fh; BIH ih;
@@ -73,6 +85,7 @@ static ImageRGB bmp_read_24(const char *path){
     return im;
 }
 
+//將 ImageRGB 寫回 BMP（bottom-up）。
 static void bmp_write_24(const char *path, const ImageRGB *im){
     FILE *fp=fopen(path,"wb"); if(!fp) die("cannot write bmp");
 
@@ -111,6 +124,14 @@ static void bmp_write_24(const char *path, const ImageRGB *im){
 
 static void img_free(ImageRGB *im){ free(im->rgb); im->rgb=NULL; }
 
+/* --------------------------------------------------------
+   可逆色彩轉換（RCT）RGB -> (Y, Cb, Cr)：
+       Y  = (R + 2G + B) / 4
+       Cb = B - G
+       Cr = R - G
+     全部用整數運算、理論上可逆（可做無損），用來降低 RGB 通道相關性，
+     讓後面的 DCT/量化更有效率。
+-------------------------------------------------------- */
 // ---------- Reversible Color Transform (lossless) ----------
 typedef struct { int w,h; int16_t *Y,*Cb,*Cr; } ImageYCCi;
 
@@ -135,6 +156,12 @@ static ImageYCCi rgb_to_ycc_rct(const ImageRGB *im){
 
 static void ycc_free(ImageYCCi *im){ free(im->Y); free(im->Cb); free(im->Cr); im->Y=im->Cb=im->Cr=NULL; }
 
+/* --------------------------------------------------------
+   8x8 DCT / IDCT：
+     - dct8x8()：空間域 -> 頻域
+     - idct8x8()：頻域 -> 空間域（encoder 不一定要用，但保留一致性）
+     使用標準 cosine basis，含 cu/cv 正規化。
+-------------------------------------------------------- */
 // ---------- DCT/IDCT ----------
 static void dct8x8(const double in[8][8], double out[8][8]){
     for(int u=0;u<8;u++){
@@ -172,6 +199,13 @@ static void idct8x8(const double in[8][8], double out[8][8]){
     }
 }
 
+/* -----------------------------------------------------------------
+   量化表：
+     使用標準 JPEG 的亮度/色度量化表（QT_Y, QT_C）。
+     量化公式：
+       q(u,v) = round( F(u,v) / QT(u,v) )
+     Mode 1 需要把 QT 輸出成文字檔提供 decoder 使用，所以有 dump_qt_txt()。
+----------------------------------------------------------------- */
 // ---------- Quantization tables (standard JPEG tables) ----------
 static const int QT_Y[8][8]={
  {16,11,10,16,24,40,51,61},
@@ -195,6 +229,7 @@ static const int QT_C[8][8]={
  {99,99,99,99,99,99,99,99}
 };
 
+//將 QT(8x8) 輸出成文字檔。
 static void dump_qt_txt(const char *path, const int qt[8][8]){
     FILE *fp=fopen(path,"w"); if(!fp) die("open Qt txt");
     for(int i=0;i<8;i++){
@@ -205,6 +240,11 @@ static void dump_qt_txt(const char *path, const int qt[8][8]){
     fclose(fp);
 }
 
+/* -----------------------------------------------------------------
+   Block 工具：
+     - get_plane_pix()：安全取值，超出邊界就 clamp（處理非 8 倍數尺寸）
+     - get_block()：從平面擷取 8x8 區塊到 double[8][8]
+----------------------------------------------------------------- */
 // ---------- Block utilities ----------
 static int16_t get_plane_pix(const int16_t *p,int w,int h,int x,int y){
     if(x<0) x=0; if(y<0) y=0;
@@ -220,6 +260,11 @@ static void get_block(const int16_t *p,int w,int h,int bx,int by,double out[8][8
     }
 }
 
+/* -----------------------------------------------------------------
+   Zigzag 掃描：
+     把 8x8 係數矩陣轉成 64 長度序列（zigzag 順序）。
+     低頻會集中在前面，高頻零更容易連續出現，有利於 RLE / Huffman 壓縮。
+----------------------------------------------------------------- */
 // ---------- ZigZag ----------
 static const uint8_t ZZ[64]={
  0,1,8,16,9,2,3,10,
@@ -237,12 +282,23 @@ static void block_to_zz(const int16_t b[8][8], int16_t out[64]){
     for(int k=0;k<64;k++) out[k]=tmp[ZZ[k]];
 }
 
+/* -----------------------------------------------------------------
+   SQNR 工具：
+     SQNR(dB) = 10*log10( Σ(signal^2) / Σ(error^2) )
+     Mode 1 會對每個係數（共 64 個）印出 Y/Cb/Cr 的 SQNR。
+----------------------------------------------------------------- */
 // ---------- SQNR ----------
 static double sqnr_db(double sig, double err){
     if(err<=0.0) return 1e9;
     return 10.0*log10(sig/err);
 }
 
+/* -----------------------------------------------------------------
+   RLE pair 與量化 block 產生：
+     - Pair(skip, val)：skip 表示前面連續 0 的數量，val 是接著的非零值
+     - make_qblock()：對某個 block 做：
+         取 8x8 -> DCT -> 量化 -> 得到 int16 q[8][8]
+----------------------------------------------------------------- */
 // ---------- RLE Pair ----------
 typedef struct { uint8_t skip; int16_t val; } Pair;
 
@@ -258,6 +314,14 @@ static void make_qblock(const int16_t *plane,int w,int h,int bx,int by,const int
     }
 }
 
+/* ------------------------------------------------
+   Mode 0（RGB 通道拆分）：
+     輸入：原始 BMP
+     輸出：
+       - R.txt / G.txt / B.txt（逐像素輸出通道值）
+       - dim.txt（寬 高）
+     作為無損基準檢查；decoder 重建後應可 cmp 完全一致。
+------------------------------------------------ */
 // ---------- Mode 0 ----------
 static void mode0(const char *bmp, const char *Rt, const char *Gt, const char *Bt, const char *dim){
     ImageRGB im=bmp_read_24(bmp);
@@ -281,6 +345,17 @@ static void mode0(const char *bmp, const char *Rt, const char *Gt, const char *B
     img_free(&im);
 }
 
+/* --------------------------------------------------------------------
+   Mode 1（DCT + 量化 + error feedback）：
+     流程：
+       BMP -> RCT(Y/Cb/Cr) -> 8x8 block -> DCT -> 量化
+     輸出檔案：
+       - Qt_Y / Qt_Cb / Qt_Cr（文字檔量化表）
+       - dim.txt（寬 高）
+       - qF_Y/Cb/Cr.raw（int16，量化後係數，依 block 順序每個 block 64 個）
+       - eF_Y/Cb/Cr.raw（float，量化造成的誤差，用於 error feedback）
+     並印出 Y/Cb/Cr 各 64 個係數的 SQNR。
+-------------------------------------------------------------------- */
 // ---------- Mode 1 ----------
 static void mode1(const char *bmp,
                   const char *QtYp,const char *QtCbp,const char *QtCrp,const char *dim,
@@ -366,6 +441,16 @@ static void mode1(const char *bmp,
     img_free(&im);
 }
 
+/* ---------------------------------------------
+   Mode 2（RLE，ASCII）：
+     建立在 Mode 1 的量化係數上，再做：
+       - Zigzag（8x8 -> 64）
+       - DC 做 DPCM：存 diff = DC - prevDC
+       - RLE：對每個非零輸出 (skip, value)
+     每行格式：
+       (by,bx, Y|Cb|Cr) skip val skip val ...
+     第一行寫入影像寬高。
+--------------------------------------------- */
 // ---------- Mode 2: DPCM + ZigZag + RLE ----------
 static void mode2_ascii(const char *bmp, const char *outtxt){
     ImageRGB im=bmp_read_24(bmp);
@@ -415,6 +500,15 @@ static void mode2_ascii(const char *bmp, const char *outtxt){
     img_free(&im);
 }
 
+/* ---------------------------------------------
+   Mode 2（RLE，Binary）：
+     輸出較緊湊的二進位格式：
+       Header：uint32 W, H, nbx, nby
+       每個 block、每個分量：
+         uint16 npairs
+         接著 npairs 組：(uint8 skip, int16 val)
+     相較 ASCII，可大幅減少輸出檔案大小。
+--------------------------------------------- */
 static void mode2_binary(const char *bmp, const char *outbin){
     ImageRGB im=bmp_read_24(bmp);
     ImageYCCi ycc=rgb_to_ycc_rct(&im);
@@ -472,6 +566,19 @@ static void mode2_binary(const char *bmp, const char *outbin){
     img_free(&im);
 }
 
+/* -----------------------------------------------------------------------
+   Mode 3（Huffman 編碼）：
+     步驟：
+       1) 依 Mode 2 邏輯產生 symbol stream：
+          - 量化 -> zigzag -> DC DPCM -> RLE pairs
+          - 每個 pair 封裝成 32-bit symbol：sym = (skip<<16) | (uint16)val
+       2) 統計符號頻率並建立 Huffman tree
+       3) 生成 (symbol -> codeword) 對照表，寫入 codebook.txt
+       4) 將 symbol stream 編碼成：
+          - ASCII：每行一個 codeword（由 0/1 組成）
+          - Binary：bit-packed 串流 + header（W,H,nbits）
+     binary 模式下額外輸出 compression ratio / compression rate。
+----------------------------------------------------------------------- */
 // ---------- Huffman (Mode 3) ----------
 typedef struct {
     uint32_t sym;     // packed (skip<<16)|(uint16)val
@@ -480,6 +587,7 @@ typedef struct {
     uint8_t  len;
 } Code;
 
+//Huffman 樹節點：cnt 為頻率，l/r 為左右子樹。
 typedef struct Node {
     uint32_t sym;
     uint32_t cnt;
@@ -504,6 +612,11 @@ static int cmp_u32(const void *a,const void *b){
     return (x<y)?-1:(x>y);
 }
 
+/* ---------------------------------------
+   以 DFS 走訪 Huffman 樹產生 code。
+     左邊補 0，右邊補 1。
+     code 用整數儲存（搭配 len 表示有效位數）。
+--------------------------------------- */
 static void build_codes_rec(Node *n, uint32_t code, uint8_t len, Code *out, int *idx){
     if(!n->l && !n->r){
         out[*idx].sym=n->sym;
@@ -532,6 +645,11 @@ static uint32_t pack_sym(uint8_t skip, int16_t val){
     return ((uint32_t)skip<<16) | (uint16_t)val;
 }
 
+/* ----------------------------------------------------
+   Binary Huffman bit writer：
+     把 bits 累積在 buffer，滿 8 bits 就輸出一個 byte。
+     Binary 檔格式：W, H, nbits_total，接著是 packed bits。
+---------------------------------------------------- */
 static void bit_put(FILE *fp, uint32_t *buf, int *nbits, uint32_t code, uint8_t len){
     // append len bits of code (MSB-first) into buffer (left shift)
     *buf = (*buf<<len) | (code & ((len==32)?0xFFFFFFFFu:((1u<<len)-1u)));
@@ -726,6 +844,12 @@ static void mode3(const char *bmp, const char *fmt, const char *codebook_txt, co
     img_free(&im);
 }
 
+/* -----------------------------------------------------------------------
+   encoder 0 in.bmp R.txt G.txt B.txt dim.txt
+     encoder 1 bmp Qt_Y Qt_Cb Qt_Cr dim qF_Y qF_Cb qF_Cr eF_Y eF_Cb eF_Cr
+     encoder 2 bmp ascii|binary rle_code.(txt|bin)
+     encoder 3 bmp ascii|binary codebook.txt huffman_code.(txt|bin)
+----------------------------------------------------------------------- */
 // ---------- main ----------
 int main(int argc, char **argv){
     if(argc<2) die("usage: encoder <mode> ...");
